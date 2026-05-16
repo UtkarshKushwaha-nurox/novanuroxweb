@@ -6,6 +6,7 @@ import { Header } from "@/components/Header";
 import { Footer } from "@/components/Footer";
 import { supabase, supabaseConfigured } from "@/lib/supabase";
 import { friendlyError } from "@/lib/friendlyError";
+import useRazorpay from "react-razorpay"; // <-- 1. Added Razorpay import
 
 const Schema = z.object({
   full_name: z.string().trim().min(2, "Enter your full name").max(80),
@@ -21,6 +22,7 @@ type FormData = z.infer<typeof Schema>;
 type SchoolOption = { school_name: string; student_capacity: number; enrolled_count: number };
 
 export default function EnrollPage() {
+  const [Razorpay] = useRazorpay(); // <-- 2. Initialized Razorpay hook
   const [schools, setSchools] = useState<SchoolOption[]>([]);
   const [loadingSchools, setLoadingSchools] = useState(true);
   const [schoolError, setSchoolError] = useState<string | null>(null);
@@ -42,8 +44,6 @@ export default function EnrollPage() {
         setLoadingSchools(false);
         return;
       }
-      // Use SECURITY DEFINER RPC so anonymous visitors only see school NAMES,
-      // not principal/contact/WhatsApp PII from school_partnerships.
       const { data, error } = await supabase.rpc("list_partner_schools");
       if (cancelled) return;
       if (error) {
@@ -67,10 +67,12 @@ export default function EnrollPage() {
     if (errors[k]) setErrors((e) => ({ ...e, [k]: undefined }));
   }
 
+  // <-- 3. Updated onSubmit function for Razorpay
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
     const parsed = Schema.safeParse(form);
+    
     if (!parsed.success) {
       const errs: Partial<Record<keyof FormData, string>> = {};
       parsed.error.issues.forEach((i) => {
@@ -80,35 +82,66 @@ export default function EnrollPage() {
       setErrors(errs);
       return;
     }
+    
     if (!supabaseConfigured) {
       setSubmitError("Backend not configured.");
       return;
     }
+
     const sel = schools.find((x) => x.school_name === parsed.data.school_name);
     if (sel && sel.student_capacity > 0 && sel.enrolled_count >= sel.student_capacity) {
       setSubmitError("This school's batch is already full. Please contact us on WhatsApp.");
       return;
     }
+
     setSubmitting(true);
-    const { error } = await supabase.from("student_enrollments").insert({
-      full_name: parsed.data.full_name,
-      class_section: parsed.data.class_section,
-      school_name: parsed.data.school_name,
-      parent_whatsapp: parsed.data.parent_whatsapp,
-    });
-    setSubmitting(false);
-    if (error) {
-      if (typeof console !== "undefined") console.error("enroll submit", error);
-      const msg = (error as { message?: string }).message ?? "";
-      if (msg.toLowerCase().includes("full") || msg.toLowerCase().includes("not an approved")) {
-        setSubmitError("Registration closed for this school (capacity reached).");
-      } else {
-        setSubmitError(friendlyError(error, "Could not register. Please try again."));
-      }
-      return;
+
+    const options = {
+      key: import.meta.env.VITE_RAZORPAY_KEY_ID, 
+      amount: "12000", // Amount is in paise (12000 paise = ₹120)
+      currency: "INR",
+      name: "Nova Nurox",
+      description: "12-Day AI Bootcamp Registration",
+      handler: async function (response: any) {
+        // Payment Success! Now save to Supabase
+        const { error } = await supabase.from("student_enrollments").insert({
+          full_name: parsed.data.full_name,
+          class_section: parsed.data.class_section,
+          school_name: parsed.data.school_name,
+          parent_whatsapp: parsed.data.parent_whatsapp,
+        });
+
+        setSubmitting(false);
+
+        if (error) {
+          if (typeof console !== "undefined") console.error("enroll submit", error);
+          setSubmitError("Payment successful, but failed to save registration. Please contact support.");
+          return;
+        }
+
+        setSuccess(true);
+        setForm({ full_name: "", class_section: "", school_name: "", parent_whatsapp: "" });
+      },
+      prefill: {
+        name: parsed.data.full_name,
+        contact: parsed.data.parent_whatsapp,
+      },
+      theme: {
+        color: "#4f46e5", // Your primary neon color
+      },
+    };
+
+    try {
+      const rzp = new Razorpay(options);
+      rzp.on("payment.failed", function () {
+        setSubmitError("Payment failed or was cancelled. Please try again.");
+        setSubmitting(false);
+      });
+      rzp.open();
+    } catch (err) {
+      setSubmitError("Could not load payment gateway. Please check your connection.");
+      setSubmitting(false);
     }
-    setSuccess(true);
-    setForm({ full_name: "", class_section: "", school_name: "", parent_whatsapp: "" });
   }
 
   return (
@@ -124,17 +157,17 @@ export default function EnrollPage() {
             <span className="text-gradient-neon">AI Bootcamp</span>
           </h1>
           <p className="mt-4 text-sm text-muted-foreground">
-            Register for your school&apos;s 10-day Nova Nurox AI Bootcamp. Limited to 20
+            Register for your school&apos;s 12-day Nova Nurox AI Bootcamp. Limited to 20
             students per batch.
           </p>
 
           {success ? (
             <div className="mt-8 rounded-2xl border border-primary/30 bg-gradient-card p-8 text-center">
               <CheckCircle2 className="mx-auto text-primary" size={42} />
-              <h2 className="mt-4 font-display text-2xl font-bold">Registration Received</h2>
+              <h2 className="mt-4 font-display text-2xl font-bold">Payment & Registration Successful!</h2>
               <p className="mt-2 text-sm text-muted-foreground">
-                Your spot is reserved. We&apos;ll WhatsApp your parent within 24 hours to
-                confirm the batch and collect the ₹104 registration fee.
+                Your spot is securely reserved. We will WhatsApp your parent within 24 hours to
+                confirm batch details.
               </p>
               <Link
                 to="/"
@@ -254,10 +287,11 @@ export default function EnrollPage() {
                 )}
               </div>
 
+              {/* <-- 4. Updated Pricing Display --> */}
               <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-xs text-foreground/90">
-                <strong>Registration Fee: ₹104</strong> (Payable after batch confirmation)
+                <strong>Registration Fee: ₹120</strong> (Securely process via Razorpay)
                 <div className="text-[11px] text-muted-foreground mt-1">
-                  Total course fee ₹149 — your school covers ₹45 (30%); parents pay ₹104 (70%).
+                  Total course fee ₹150 — your school covers ₹30; parents pay ₹120.
                 </div>
               </div>
 
@@ -277,7 +311,7 @@ export default function EnrollPage() {
                 ) : (
                   <Rocket size={16} />
                 )}
-                Register for Batch
+                Pay ₹120 & Register
               </button>
             </form>
           )}
